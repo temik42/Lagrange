@@ -5,237 +5,263 @@
 #define NY %(ny)d
 #define NZ %(nz)d
     
-#define mm(i,j) (i>j)?i*(i+1)/2+j:j*(j+1)/2+i //"smart" index for triagngular matrices    
+#include <math.cl>
 
-
+__constant float gamma = 5./3;
 __constant unsigned int ng[3] = {NX,NY,NZ};
 __constant unsigned int bg[3] = {NY*NZ,NZ,1};
-__constant unsigned int bl[3] = {NL*NL,NL,1};
 
-
-struct rb_str {
-    float3 force;
-    float3 current;
-    float3 field;
+struct q_str {
+    float3 dX[3],dXb[3],d2X[6],dV[3],B,dB[3];
+    float det_dX,d_det_dX[3],G[6],T,dT[3];
 };
 
 
-float3 Cross(float3 U, float3 V)
-{
-    float3 Y;
-    Y.x = U.y*V.z - U.z*V.y;
-    Y.y = U.z*V.x - U.x*V.z;
-    Y.z = U.x*V.y - U.y*V.x;
-    
-    return Y;
-}
-
-
-
-float3 Deriv(__local float3* Xl, unsigned int ldx, uchar dim, uchar order)
-{  
-    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
-       
-    float3 out;
-      
-    if ((ii[dim] != 0) && (ii[dim] != (ng[dim]-1))) { 
-        if (order == 1) out = Xl[ldx+bl[dim]]*(float3)(0.5) - Xl[ldx-bl[dim]]*(float3)(0.5);
-        if (order == 2) out = Xl[ldx+bl[dim]] + Xl[ldx-bl[dim]] - (float3)(2)*Xl[ldx];              
-    } else if (ii[dim] == 0) {
-        if (order == 1) out = -(float3)(1.5)*Xl[ldx] + (float3)(2)*Xl[ldx+bl[dim]] - (float3)(0.5)*Xl[ldx+2*bl[dim]]; 
-        if (order == 2) out = (float3)(2)*Xl[ldx] - (float3)(5)*Xl[ldx+bl[dim]] + (float3)(4)*Xl[ldx+2*bl[dim]] - Xl[ldx+3*bl[dim]];
-    } else if (ii[dim] == (ng[dim]-1)) {
-        if (order == 1) out = (float3)(1.5)*Xl[ldx] - (float3)(2)*Xl[ldx-bl[dim]] + (float3)(0.5)*Xl[ldx-2*bl[dim]];
-        if (order == 2) out = (float3)(2)*Xl[ldx] - (float3)(5)*Xl[ldx-bl[dim]] + (float3)(4)*Xl[ldx-2*bl[dim]] - Xl[ldx-3*bl[dim]];
-    }
-    return out;
-}
-
-__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE)))
-void toLocal(__global float3* X, __local float3* Xl)
+void __attribute__((overloadable)) 
+toPrivate(__global float* X, float* Xp)
 {      
     unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
     unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
     
-    unsigned int ll[3] = {get_local_id(0)+1,get_local_id(1)+1,get_local_id(2)+1};
-    unsigned int ldx = ll[0]*bl[0]+ll[1]*bl[1]+ll[2]*bl[2];
+    char i,j,k;
+
+    for (i = -1; i < 2; i++) 
+        for (j = -1; j < 2; j++) 
+            for (k = -1; k < 2; k++)  
+                if ((ii[0]+i>=0) && (ii[0]+i<=ng[0]-1) && (ii[1]+j>=0) && (ii[1]+j<=ng[1]-1) && (ii[2]+k>=0) && (ii[2]+k<=ng[2]-1)) 
+                    Xp[jdx + i*bp[0] + j*bp[1] + k*bp[2]] = X[idx + i*bg[0] + j*bg[1] + k*bg[2]]; 
+}
+
+
+void __attribute__((overloadable)) 
+toPrivate(__global float3* X, float3* Xp)
+{      
+    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
+    unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
     
+    char i,j,k;
+
+    for (i = -1; i < 2; i++) 
+        for (j = -1; j < 2; j++) 
+            for (k = -1; k < 2; k++)  
+                if ((ii[0]+i>=0) && (ii[0]+i<=ng[0]-1) && (ii[1]+j>=0) && (ii[1]+j<=ng[1]-1) && (ii[2]+k>=0) && (ii[2]+k<=ng[2]-1)) 
+                    Xp[jdx + i*bp[0] + j*bp[1] + k*bp[2]] = X[idx + i*bg[0] + j*bg[1] + k*bg[2]]; 
+}
+
+
+
+struct q_str __attribute__((overloadable)) 
+    Forward(float3* Xp, float3* Vp, float* Tp, float* Bp)
+{
+    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
+
+    float B, dB[3], T, dT[3];
+    
+    struct q_str Q; 
     uchar i,j;
+
+    jacobian(Xp, Q.dX);
     
-    Xl[ldx] = X[idx];
+    hessian(Xp, Q.d2X);
+    jacobian(Vp, Q.dV);
+    jacobian(Tp, dT);  
+    //jacobian(Tp, Q.dT);    
+    //Q.T = Tp[jdx];
+    T = Tp[jdx];
+    jacobian(Bp, dB);
+    B = Bp[jdx];
+    
+    Q.dX[0].x += 1;
+    Q.dX[1].y += 1;
+    Q.dX[2].z += 1;
+    
+    //-----------------------------the rest of code uses only private memory-------------------------------------
+    
+
+    Q.det_dX = Q.dX[0].x*Q.dX[1].y*Q.dX[2].z + Q.dX[0].y*Q.dX[1].z*Q.dX[2].x + Q.dX[0].z*Q.dX[1].x*Q.dX[2].y - 
+           Q.dX[0].x*Q.dX[1].z*Q.dX[2].y - Q.dX[0].y*Q.dX[1].x*Q.dX[2].z - Q.dX[0].z*Q.dX[1].y*Q.dX[2].x;
+    
+    Q.dXb[0] = Cross(Q.dX[1], Q.dX[2])/Q.det_dX;
+    Q.dXb[1] = Cross(Q.dX[2], Q.dX[0])/Q.det_dX;
+    Q.dXb[2] = Cross(Q.dX[0], Q.dX[1])/Q.det_dX;
+    
+    for (i = 0; i < 3; i++) 
+        for (j = 0; j <= i; j++) Q.G[mm(i,j)] = Dot(Q.dXb[i],Q.dXb[j]);   
+    
+    
+    Q.B = Q.dX[2]*B/Q.det_dX;
     
     for (i = 0; i < 3; i++) {
-        if ((ll[i] == 1) && (ii[i] != 0)) Xl[ldx-bl[i]] = X[idx-bg[i]];
-        if ((ll[i] == NL-2) && (ii[i] != ng[i]-1)) Xl[ldx+bl[i]] = X[idx+bg[i]];
-        for (j = 0; j < i; j++) {
-            if ((ll[i] == 1) && (ll[j] == 1) && (ii[i] != 0) && (ii[j] != 0)) Xl[ldx-bl[i]-bl[j]] = X[idx-bg[i]-bg[j]];
-            if ((ll[i] == 1) && (ll[j] == NL-2) && (ii[i] != 0) && (ii[j] != ng[j]-1)) Xl[ldx-bl[i]+bl[j]] = X[idx-bg[i]+bg[j]];
-            if ((ll[i] == NL-2) && (ll[j] == 1) && (ii[i] != ng[i]-1) && (ii[j] != 0)) Xl[ldx+bl[i]-bl[j]] = X[idx+bg[i]-bg[j]];
-            if ((ll[i] == NL-2) && (ll[j] == NL-2) && (ii[i] != ng[i]-1) && (ii[j] != ng[j]-1)) Xl[ldx+bl[i]+bl[j]] = X[idx+bg[i]+bg[j]];
-        }
+        Q.d_det_dX[i] = 0.;   
+        for (j = 0; j < 3; j++) 
+            Q.d_det_dX[i] += Q.d2X[mm(i,j)].x*Q.dXb[j].x + Q.d2X[mm(i,j)].y*Q.dXb[j].y + Q.d2X[mm(i,j)].z*Q.dXb[j].z;
+        Q.d_det_dX[i] *= Q.det_dX;
     }
     
-    if ((ll[0] == 1) && (ll[1] == 1) && (ll[2] == 1) && (ii[0] != 0) && (ii[1] != 0) && (ii[2] != 0))
-        Xl[ldx-bl[0]-bl[1]-bl[2]] = X[idx-bg[0]-bg[1]-bg[2]];
-    if ((ll[0] == 1) && (ll[1] == 1) && (ll[2] == NL-2) && (ii[0] != 0) && (ii[1] != 0) && (ii[2] != ng[2]-1))
-        Xl[ldx-bl[0]-bl[1]+bl[2]] = X[idx-bg[0]-bg[1]+bg[2]];
-    if ((ll[0] == 1) && (ll[1] == NL-2) && (ll[2] == 1) && (ii[0] != 0) && (ii[1] != ng[1]-1) && (ii[2] != 0))
-        Xl[ldx-bl[0]+bl[1]-bl[2]] = X[idx-bg[0]+bg[1]-bg[2]];
-    if ((ll[0] == NL-2) && (ll[1] == 1) && (ll[2] == 1) && (ii[0] != ng[0]-1) && (ii[1] != 0) && (ii[2] != 0))
-        Xl[ldx+bl[0]-bl[1]-bl[2]] = X[idx+bg[0]-bg[1]-bg[2]];
-    if ((ll[0] == 1) && (ll[1] == NL-2) && (ll[2] == NL-2) && (ii[0] != 0) && (ii[1] != ng[0]-1) && (ii[2] != ng[2]-1))
-        Xl[ldx-bl[0]+bl[1]+bl[2]] = X[idx-bg[0]+bg[1]+bg[2]];
-    if ((ll[0] == NL-2) && (ll[1] == 1) && (ll[2] == NL-2) && (ii[0] != ng[0]-1) && (ii[1] != 0) && (ii[2] != ng[2]-1))
-        Xl[ldx+bl[0]-bl[1]+bl[2]] = X[idx+bg[0]-bg[1]+bg[2]];
-    if ((ll[0] == NL-2) && (ll[1] == NL-2) && (ll[2] == 1) && (ii[0] != ng[0]-1) && (ii[1] != ng[1]-1) && (ii[2] != 0))
-        Xl[ldx+bl[0]+bl[1]-bl[2]] = X[idx+bg[0]+bg[1]-bg[2]];
-    if ((ll[0] == NL-2) && (ll[1] == NL-2) && (ll[2] == NL-2) && (ii[0] != ng[0]-1) && (ii[1] != ng[1]-1) && (ii[2] != ng[2]-1))
-        Xl[ldx+bl[0]+bl[1]+bl[2]] = X[idx+bg[0]+bg[1]+bg[2]];
+    Q.T = T*pow(Q.det_dX, gamma-1);
+    for (i = 0; i < 3; i++) Q.dT[i] = dT[i]*pow(Q.det_dX, gamma-1) + Q.d_det_dX[i]*Q.T*(gamma-1)*pow(Q.det_dX, gamma-2);  
     
-    barrier(CLK_LOCAL_MEM_FENCE);   
+       
+    for (i = 0; i < 3; i++) {
+        Q.dB[i] = - Q.B*Q.d_det_dX[i] + Q.dX[2]*dB[i] + Q.d2X[mm(i,2)]*B;        
+        //Q.dB[i] /= (float3)(Q.det_dX);
+    }
+    return Q;
 }
+
 
 __kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE)))
-void Jacobian(__global float3* X, __global float3* J)
-{
-    __local float3 Xl[NL*NL*NL];
+void Reverse(__global float3* Xg, __global float3* Bg, __global float3* Bg0)
+{       
     
     unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
     unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
     
-    unsigned int ll[3] = {get_local_id(0)+1,get_local_id(1)+1,get_local_id(2)+1};
-    unsigned int ldx = ll[0]*bl[0]+ll[1]*bl[1]+ll[2]*bl[2];
+    float3 Xp[27],Bp[27],B,B0;
     
-    uchar i;
-    toLocal(X,Xl);
+    toPrivate(Xg,Xp);
+    toPrivate(Bg,Bp);
     
-    for (i = 0; i < 3; i++) J[idx + i*NX*NY*NZ] = Deriv(Xl, ldx, i, 1);
-    barrier(CLK_GLOBAL_MEM_FENCE);
-}
+    B = Bp[jdx];
 
-
-
-struct rb_str rotB(__local float3* Xl, __global float3* Bg, __global float3* DB)
-{
-    __local float3 dXl[NL*NL*NL];
+    float3 dX[3], dB[3], dXb[3];
     
-    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
-    unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
+    jacobian(Xp, dX);
+    jacobian(Bp, dB);
     
-    unsigned int ll[3] = {get_local_id(0)+1,get_local_id(1)+1,get_local_id(2)+1};
-    unsigned int ldx = ll[0]*bl[0]+ll[1]*bl[1]+ll[2]*bl[2];
-    
-    float3 dX[3],dXb[3],d2X[6],B,Bx,dB[3],dBx[3];
-    float det_dX,d_det_dX[3];
-    uchar i,j;
-    
-    //loading field to private memory
-    B = Bg[idx];
-
-    for (i = 0; i < 3; i++) {
-        dB[i] = DB[idx + i*NX*NY*NZ];
-        
-        //computing first and second derivatives of X
-        d2X[i*(i+3)/2] = Deriv(Xl, ldx, i, 2);
-        dX[i] = Deriv(Xl, ldx, i, 1);
-        barrier(CLK_LOCAL_MEM_FENCE);
-        
-        //loading Jacobian to local memory
-        if (i != 0) dXl[ldx] = dX[i];
-        
-        //computing cross-dimentional secong derivatives of X
-        
-        for (j = 0; j < i; j++) {
-            if (ll[j] == 1) dXl[ldx-bl[j]] = Deriv(Xl, ldx-bl[j], i, 1);
-            if (ll[j] == NL-2) dXl[ldx+bl[j]] = Deriv(Xl, ldx+bl[j], i, 1);
-            barrier(CLK_LOCAL_MEM_FENCE);
-            d2X[i*(i+1)/2+j] = Deriv(dXl, ldx, j, 1);
-        }
-    }
+    float det_dX;
     
     dX[0].x += 1;
     dX[1].y += 1;
     dX[2].z += 1;
     
-    //-----------------------------the rest of code uses only private memory-------------------------------------
-    
     det_dX = dX[0].x*dX[1].y*dX[2].z + dX[0].y*dX[1].z*dX[2].x + dX[0].z*dX[1].x*dX[2].y - 
-           dX[0].x*dX[1].z*dX[2].y - dX[0].y*dX[1].x*dX[2].z - dX[0].z*dX[1].y*dX[2].x;
-    
-    //det_dX = 1 + dX[1].y*dX[2].z - dX[1].z*dX[2].y + dX[0].x*dX[1].y - dX[0].y*dX[1].x + dX[0].x*dX[2].z - dX[0].z*dX[2].x;
-    
-    //dX[0].x += 1;
-    //dX[1].y += 1;
-    //dX[2].z += 1;
+           dX[0].x*dX[1].z*dX[2].y - dX[0].y*dX[1].x*dX[2].z - dX[0].z*dX[1].y*dX[2].x;    
     
     dXb[0] = Cross(dX[1], dX[2])/(float3)(det_dX);
     dXb[1] = Cross(dX[2], dX[0])/(float3)(det_dX);
     dXb[2] = Cross(dX[0], dX[1])/(float3)(det_dX);
     
-    Bx.x = dX[0].x*B.x + dX[1].x*B.y + dX[2].x*B.z;
-    Bx.y = dX[0].y*B.x + dX[1].y*B.y + dX[2].y*B.z;
-    Bx.z = dX[0].z*B.x + dX[1].z*B.y + dX[2].z*B.z;
+    B0.x = Dot(dXb[0],B);
+    B0.y = Dot(dXb[1],B);
+    B0.z = Dot(dXb[2],B);
     
-    Bx /= (float3)det_dX;
+    B0 *= (float3)det_dX;
     
-    for (i = 0; i < 3; i++) {
-        d_det_dX[i] = 0.;   
-        for (j = 0; j < 3; j++) d_det_dX[i] += d2X[mm(i,j)].x*dXb[j].x + d2X[mm(i,j)].y*dXb[j].y + d2X[mm(i,j)].z*dXb[j].z;
-        d_det_dX[i] *= det_dX;
-    }
-       
-    for (i = 0; i < 3; i++) {
-        dBx[i] = -(float3)(d_det_dX[i])*Bx;
+    Bg[idx] = B0;
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
 
-        dBx[i].x += dX[0].x*dB[i].x + dX[1].x*dB[i].y + dX[2].x*dB[i].z;
-        dBx[i].y += dX[0].y*dB[i].x + dX[1].y*dB[i].y + dX[2].y*dB[i].z;
-        dBx[i].z += dX[0].z*dB[i].x + dX[1].z*dB[i].y + dX[2].z*dB[i].z;
-        
-        dBx[i].x += d2X[mm(i,0)].x*B.x + d2X[mm(i,1)].x*B.y + d2X[mm(i,2)].x*B.z;
-        dBx[i].y += d2X[mm(i,0)].y*B.x + d2X[mm(i,1)].y*B.y + d2X[mm(i,2)].y*B.z;
-        dBx[i].z += d2X[mm(i,0)].z*B.x + d2X[mm(i,1)].z*B.y + d2X[mm(i,2)].z*B.z;
 
-        dBx[i] /= (float3)(det_dX);
-    }
+float3 Lorenz(struct q_str Q) {
     
-    struct rb_str out;
-    out.current = (float3)0;
-    out.field = Bx;
+    float3 out;
+    float3 current = 0;
+    
+    uchar i;
     
     for (i = 0; i < 3; i++) {
-        out.current += Cross(dXb[i], dBx[i]);
+        current += Cross(Q.dXb[i], Q.dB[i]);  //не забудь поделить на 4*pi!!!
     }
-    out.force = Cross(out.current, Bx)*det_dX;
-    //out.force.x += d_det_dX[0]/det_dX;
-    //out.force.y += d_det_dX[1]/det_dX;
-    //out.force.z += d_det_dX[2]/det_dX;
+    out = Cross(current, Q.B);//*Q.det_dX;
     return out;
 }
 
 
+float3 Pressure(struct q_str Q) {
+    
+    float3 gradT = 0;
+    float3 grad_det_dX = 0;
+    
+    uchar i,j;
+    
+    for (i = 0; i < 3; i++) 
+        for (j = 0; j < 3; j++) {
+            gradT += Q.G[mm(i,j)]*Q.dT[j]*Q.dX[i];
+            grad_det_dX += Q.G[mm(i,j)]*Q.d_det_dX[j]*Q.dX[i];
+        }
+    
+    return (grad_det_dX*Q.T/Q.det_dX-gradT);
+}
 
-__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE)))
-void Step(__global float3* X, __global float3* Fx, __global float3* V, __global float3* Fv, __global float3* B, __global float3* DB,
-               float step)
+
+
+
+
+__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE))) 
+void Step(__global float3* Xg, __global float3* Vg, __global float3* DVg, __global float* Tg,
+          __global float* Bg)
 {       
-    __local float3 Xl[NL*NL*NL];
     
     unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
     unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
     
-    unsigned int ll[3] = {get_local_id(0)+1,get_local_id(1)+1,get_local_id(2)+1};
-    unsigned int ldx = ll[0]*bl[0]+ll[1]*bl[1]+ll[2]*bl[2];
-
-    toLocal(X,Xl);
- 
-    float3 Xp = Xl[ldx];
-    float3 Vp = V[idx];
-
-    struct rb_str temp;
-    temp = rotB(Xl, B, DB);
+    float3 Xp[27],Vp[27];
+    float Tp[27],Bp[27];
     
-    Fx[idx] = Vp;
-    Fv[idx] = temp.force;
+    toPrivate(Xg,Xp);
+    toPrivate(Bg,Bp);
+    toPrivate(Vg,Vp);
+    toPrivate(Tg,Tp);
+
+    
+    struct q_str Q;
+    Q = Forward(Xp, Vp, Tp, Bp);
+    
+    DVg[idx] = Lorenz(Q) + Pressure(Q)*0.02f;
     barrier(CLK_GLOBAL_MEM_FENCE);
 }
+
+
+__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE))) 
+void Increment(__global float3* Xg, __global float3* X0g, __global float3* DXg, 
+               __global float3* Vg, __global float3* V0g, __global float3* DVg, float a)
+{       
+    
+    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
+    unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
+    
+    Xg[idx] = X0g[idx] + DXg[idx]*a;
+    Vg[idx] = V0g[idx] + DVg[idx]*a;
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+
+__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE))) 
+void Put(__global float3* Xg, __global float3* Vg, unsigned int ind, uchar dim)
+{       
+    
+    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
+    unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
+    unsigned int jdx;
+        
+    if (dim == 0) jdx = ii[1]*NZ + ii[2];
+    if (dim == 1) jdx = ii[0]*NZ + ii[2]; 
+    if (dim == 2) jdx = ii[0]*NY + ii[1];
+    
+    if (ii[dim] == ind) Xg[idx] = Vg[jdx];
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+
+__kernel __attribute__((reqd_work_group_size(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE))) 
+void Take(__global float3* Xg, __global float3* Vg, unsigned int ind, uchar dim)
+{       
+    
+    unsigned int ii[3] = {get_global_id(0),get_global_id(1),get_global_id(2)};
+    unsigned int idx = ii[0]*bg[0]+ii[1]*bg[1]+ii[2]*bg[2];
+    unsigned int jdx;
+        
+    if (dim == 0) jdx = ii[1]*NZ + ii[2];
+    if (dim == 1) jdx = ii[0]*NZ + ii[2]; 
+    if (dim == 2) jdx = ii[0]*NY + ii[1];
+    
+    if (ii[dim] == ind) Vg[jdx] = Xg[idx];
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+
 
